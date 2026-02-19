@@ -331,7 +331,9 @@ public class TestAddExchangesPlans
     @Test
     public void testImplementOffsetWithUnorderedSource()
     {
-        // no ordering of output is expected; repartitioning exchange is present in the plan
+        // no ordering of output is expected; no repartitioning exchange is added because the
+        // order-sensitive RowNumber on a single stream produces ordered properties, preventing
+        // ROUND_ROBIN fan-out that would be both unnecessary and potentially harmful
         assertPlan(
                 "SELECT name FROM nation OFFSET 5 LIMIT 2",
                 any(
@@ -339,17 +341,14 @@ public class TestAddExchangesPlans
                                 ImmutableMap.of("name", expression(new Reference(VARCHAR, "name"))),
                                 filter(
                                         new Comparison(GREATER_THAN, new Reference(BIGINT, "row_num"), new Constant(BIGINT, 5L)),
-                                        exchange(
-                                                LOCAL,
-                                                REPARTITION,
-                                                rowNumber(
-                                                        pattern -> pattern
-                                                                .partitionBy(ImmutableList.of()),
-                                                        limit(
-                                                                7,
-                                                                anyTree(
-                                                                        tableScan("nation", ImmutableMap.of("name", "name")))))
-                                                        .withAlias("row_num", new RowNumberSymbolMatcher()))))));
+                                        rowNumber(
+                                                pattern -> pattern
+                                                        .partitionBy(ImmutableList.of()),
+                                                limit(
+                                                        7,
+                                                        anyTree(
+                                                                tableScan("nation", ImmutableMap.of("name", "name")))))
+                                                .withAlias("row_num", new RowNumberSymbolMatcher())))));
     }
 
     @Test

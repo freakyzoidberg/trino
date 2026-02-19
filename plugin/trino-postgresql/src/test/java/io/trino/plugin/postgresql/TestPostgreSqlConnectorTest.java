@@ -43,6 +43,7 @@ import io.trino.sql.planner.plan.JoinNode;
 import io.trino.sql.planner.plan.ProjectNode;
 import io.trino.sql.planner.plan.TableScanNode;
 import io.trino.sql.planner.plan.TopNNode;
+import io.trino.sql.tree.ExplainType;
 import io.trino.testing.QueryRunner;
 import io.trino.testing.TestingConnectorBehavior;
 import io.trino.testing.sql.JdbcSqlExecutor;
@@ -1515,5 +1516,61 @@ public class TestPostgreSqlConnectorTest
         String tableName = testTable.getName();
         onRemoteDatabase().execute(format("ALTER TABLE %s ADD CONSTRAINT %s PRIMARY KEY (%s)", tableName, "pk_" + tableName, primaryKey));
         return testTable;
+    }
+
+    @Test
+    public void testOffsetOrderingWithTopNPushdown()
+    {
+        skipTestUnless(hasBehavior(SUPPORTS_TOPN_PUSHDOWN));
+
+        // Without OFFSET: fully pushed down, ordered, no ROUND_ROBIN exchange
+        assertThat(query("SELECT name FROM nation ORDER BY name ASC LIMIT 10"))
+                .ordered()
+                .isFullyPushedDown();
+        String noOffsetPlan = getExplainPlan("SELECT name FROM nation ORDER BY name ASC LIMIT 10", ExplainType.Type.DISTRIBUTED);
+        assertThat(noOffsetPlan)
+                .as("Plan without OFFSET should not contain ROUND_ROBIN exchange.\nPlan:\n%s", noOffsetPlan)
+                .doesNotContain("ROUND_ROBIN");
+
+        // With OFFSET: verify the plan does NOT contain a ROUND_ROBIN exchange that would
+        // break the ordering guarantee from TopN pushdown. ImplementOffset converts OFFSET
+        // into an order-sensitive RowNumber node, and StreamPropertyDerivations marks its
+        // output as ordered (preserving the physical row sequence from the pushed-down TopN),
+        // which prevents AddLocalExchanges from inserting a ROUND_ROBIN fan-out.
+        String offsetQuery = "SELECT name FROM nation ORDER BY name ASC, nationkey ASC OFFSET 10 LIMIT 5";
+        String offsetPlan = getExplainPlan(offsetQuery, ExplainType.Type.DISTRIBUTED);
+        assertThat(offsetPlan)
+                .as("Plan with OFFSET should not contain ROUND_ROBIN exchange.\nPlan:\n%s", offsetPlan)
+                .doesNotContain("ROUND_ROBIN");
+
+        // Empirical verification: confirm that ORDER BY + OFFSET + LIMIT returns
+        // deterministically ordered results with high parallelism.
+        // Uses bigint ORDER BY to avoid varchar collation mismatch between
+        // PostgreSQL (locale-aware) and Trino (binary comparison).
+        try (TestTable testTable = newTrinoTable(
+                "test_offset_ordering",
+                "(id bigint)",
+                range(0, 10_000).mapToObj(i -> String.valueOf(i)).collect(toImmutableList()))) {
+            Session highConcurrency = Session.builder(getSession())
+                    .setSystemProperty("task_concurrency", "128")
+                    .build();
+
+            for (int attempt = 0; attempt < 20; attempt++) {
+                List<Long> ids = computeActual(highConcurrency,
+                        "SELECT id FROM " + testTable.getName() +
+                                " ORDER BY id ASC OFFSET 500 LIMIT 8000")
+                        .getMaterializedRows().stream()
+                        .map(row -> (Long) row.getField(0))
+                        .collect(toImmutableList());
+
+                assertThat(ids).hasSize(8000);
+
+                for (int i = 0; i < ids.size(); i++) {
+                    assertThat(ids.get(i))
+                            .as("Row %d should be id %d at attempt %d", i, 500 + i, attempt)
+                            .isEqualTo(500L + i);
+                }
+            }
+        }
     }
 }

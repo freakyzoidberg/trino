@@ -657,7 +657,15 @@ public final class StreamPropertyDerivations
         @Override
         public StreamProperties visitRowNumber(RowNumberNode node, List<StreamProperties> inputProperties)
         {
-            return Iterables.getOnlyElement(inputProperties);
+            StreamProperties input = Iterables.getOnlyElement(inputProperties);
+            // An order-sensitive RowNumber on a single stream preserves the physical row
+            // sequence of its input. Mark the output as ordered so that AddLocalExchanges
+            // does not insert a ROUND_ROBIN exchange above it that would destroy the ordering
+            // established by a pushed-down TopN in the connector.
+            if (node.isOrderSensitive() && input.isSingleStream()) {
+                return StreamProperties.ordered();
+            }
+            return input;
         }
 
         @Override
